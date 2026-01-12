@@ -1,0 +1,292 @@
+name: Inject CyberKit into IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct download URL for decrypted browser IPA'
+        required: true
+        type: string
+      cyberkit_tag:
+        description: 'CyberKit release tag (e.g., v0.0.9-alpha)'
+        required: true
+        default: 'v0.0.9-alpha'
+        type: string
+      output_name:
+        description: 'Output IPA filename (without extension)'
+        required: false
+        default: 'Browser-CyberKit'
+        type: string
+
+jobs:
+  inject:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid
+          echo "✓ ldid installed"
+
+      - name: Download CyberKit release
+        run: |
+          echo "📦 Fetching CyberKit ${{ inputs.cyberkit_tag }}..."
+
+          # Get release assets from GitHub API
+          RELEASE_URL="https://api.github.com/repos/CyberKitGroup/CyberKit/releases/tags/${{ inputs.cyberkit_tag }}"
+          ASSETS=$(curl -sL "$RELEASE_URL" | jq -r '.assets[] | select(.name | endswith(".tipa")) | .browser_download_url' | head -1)
+
+          if [ -z "$ASSETS" ]; then
+            echo "❌ No .tipa found in release ${{ inputs.cyberkit_tag }}"
+            exit 1
+          fi
+
+          echo "⬇️ Downloading: $ASSETS"
+          curl -L -o cyberkit.tipa "$ASSETS"
+
+          # Extract CyberKit frameworks
+          mkdir -p cyberkit_extract
+          unzip -q cyberkit.tipa -d cyberkit_extract
+
+          # Find the .app and copy frameworks
+          CYBERKIT_APP=$(find cyberkit_extract/Payload -name "*.app" -type d | head -1)
+          mkdir -p cyberkit_frameworks
+
+          # Copy all frameworks except the browser-specific one
+          for fw in "$CYBERKIT_APP/Frameworks"/*; do
+            basename_fw=$(basename "$fw")
+            if [[ "$basename_fw" != "MobileMiniBrowser.framework" ]]; then
+              cp -R "$fw" cyberkit_frameworks/
+              echo "  ✓ Copied $basename_fw"
+            fi
+          done
+
+          echo "✓ CyberKit frameworks extracted"
+
+      - name: Download target IPA
+        run: |
+          echo "📦 Downloading target IPA..."
+          curl -L -o target.ipa "${{ inputs.ipa_url }}"
+
+          # Extract IPA
+          mkdir -p target_extract
+          unzip -q target.ipa -d target_extract
+
+          # Find the .app directory
+          TARGET_APP=$(find target_extract/Payload -name "*.app" -type d | head -1)
+          echo "TARGET_APP=$TARGET_APP" >> $GITHUB_ENV
+
+          # Get the executable name (same as .app name without extension)
+          APP_NAME=$(basename "$TARGET_APP" .app)
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+
+          echo "✓ Target IPA extracted: $APP_NAME"
+
+      - name: Patch load commands
+        run: |
+          echo "🔧 Patching load commands..."
+
+          TARGET_APP="${{ env.TARGET_APP }}"
+          APP_NAME="${{ env.APP_NAME }}"
+
+          # Find the main executable
+          EXECUTABLE="$TARGET_APP/$APP_NAME"
+
+          if [ ! -f "$EXECUTABLE" ]; then
+            # Try to find it in case name differs
+            EXECUTABLE=$(find "$TARGET_APP" -maxdepth 1 -type f -perm +111 | head -1)
+          fi
+
+          echo "  Executable: $EXECUTABLE"
+
+          # Check for WebKit dependency and patch it
+          if otool -L "$EXECUTABLE" | grep -q "/System/Library/Frameworks/WebKit.framework"; then
+            echo "  ✓ Found WebKit dependency, patching..."
+            install_name_tool -change \
+              /System/Library/Frameworks/WebKit.framework/WebKit \
+              @rpath/WebKit.framework/WebKit \
+              "$EXECUTABLE"
+          fi
+
+          # Also check for JavaScriptCore if needed
+          if otool -L "$EXECUTABLE" | grep -q "/System/Library/Frameworks/JavaScriptCore.framework"; then
+            echo "  ✓ Found JavaScriptCore dependency, patching..."
+            install_name_tool -change \
+              /System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore \
+              @rpath/JavaScriptCore.framework/JavaScriptCore \
+              "$EXECUTABLE"
+          fi
+
+          # Patch any frameworks in the app that also depend on WebKit
+          if [ -d "$TARGET_APP/Frameworks" ]; then
+            for fw in "$TARGET_APP/Frameworks"/*.framework; do
+              if [ -d "$fw" ]; then
+                fwname=$(basename "$fw" .framework)
+                fwbin="$fw/$fwname"
+                if [ -f "$fwbin" ]; then
+                  if otool -L "$fwbin" 2>/dev/null | grep -q "/System/Library/Frameworks/WebKit.framework"; then
+                    echo "  ✓ Patching framework: $fwname"
+                    install_name_tool -change \
+                      /System/Library/Frameworks/WebKit.framework/WebKit \
+                      @rpath/WebKit.framework/WebKit \
+                      "$fwbin"
+                  fi
+                fi
+              fi
+            done
+          fi
+
+          echo "✓ Load commands patched"
+
+      - name: Copy CyberKit frameworks
+        run: |
+          echo "📁 Copying CyberKit frameworks..."
+
+          TARGET_APP="${{ env.TARGET_APP }}"
+          mkdir -p "$TARGET_APP/Frameworks"
+
+          for fw in cyberkit_frameworks/*; do
+            cp -R "$fw" "$TARGET_APP/Frameworks/"
+            echo "  ✓ Copied $(basename $fw)"
+          done
+
+          echo "✓ Frameworks copied"
+
+      - name: Create entitlements file
+        run: |
+          cat > entitlements.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>platform-application</key>
+              <true/>
+              <key>com.apple.private.security.no-sandbox</key>
+              <true/>
+              <key>com.apple.private.mobileinstall.allowedSPI</key>
+              <array>
+                  <string>Lookup</string>
+                  <string>Install</string>
+                  <string>Browse</string>
+                  <string>Uninstall</string>
+                  <string>LookupForLaunchServices</string>
+                  <string>InstallForLaunchServices</string>
+                  <string>BrowseForLaunchServices</string>
+                  <string>UninstallForLaunchServices</string>
+                  <string>UpdatePlaceholder</string>
+                  <string>InstallLocalProvisioned</string>
+                  <string>RemoveInactivePaths</string>
+              </array>
+              <key>com.apple.private.persona-mgmt</key>
+              <true/>
+              <key>com.apple.private.security.storage.AppBundles</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          echo "✓ Entitlements file created"
+
+      - name: Fakesign all binaries
+        run: |
+          echo "🔏 Fakesigning binaries..."
+
+          TARGET_APP="${{ env.TARGET_APP }}"
+          APP_NAME="${{ env.APP_NAME }}"
+
+          # Function to merge entitlements and sign
+          fakesign_binary() {
+            local bin="$1"
+            local name="$2"
+
+            # Try to get existing entitlements
+            existing_ents=$(ldid -e "$bin" 2>/dev/null || echo "")
+
+            if [ -n "$existing_ents" ] && echo "$existing_ents" | grep -q "<dict>"; then
+              # Merge entitlements
+              static_ents=$(cat entitlements.plist)
+              static_ents=${static_ents%</dict>*}
+              existing_ents=${existing_ents#*<dict>}
+              existing_ents=${existing_ents%</dict>*}
+              echo "${static_ents}${existing_ents}</dict></plist>" > merged_ents.plist
+              ldid -S"merged_ents.plist" "$bin"
+              rm -f merged_ents.plist
+            else
+              ldid -S"entitlements.plist" "$bin"
+            fi
+
+            echo "  ✓ Signed: $name"
+          }
+
+          # Sign the main executable
+          EXECUTABLE="$TARGET_APP/$APP_NAME"
+          if [ -f "$EXECUTABLE" ]; then
+            fakesign_binary "$EXECUTABLE" "$APP_NAME"
+          fi
+
+          # Sign all frameworks
+          if [ -d "$TARGET_APP/Frameworks" ]; then
+            for fw in "$TARGET_APP/Frameworks"/*.framework; do
+              if [ -d "$fw" ]; then
+                fwname=$(basename "$fw" .framework)
+                fwbin="$fw/$fwname"
+                if [ -f "$fwbin" ]; then
+                  fakesign_binary "$fwbin" "$fwname.framework"
+                fi
+              fi
+            done
+
+            # Sign dylibs
+            for dylib in "$TARGET_APP/Frameworks"/*.dylib; do
+              if [ -f "$dylib" ]; then
+                fakesign_binary "$dylib" "$(basename $dylib)"
+              fi
+            done
+          fi
+
+          # Sign XPC services if present
+          for xpc_dir in "$TARGET_APP/Frameworks"/*.framework/XPCServices/*.xpc; do
+            if [ -d "$xpc_dir" ]; then
+              xpcname=$(basename "$xpc_dir" .xpc)
+              if [ -f "$xpc_dir/$xpcname" ]; then
+                fakesign_binary "$xpc_dir/$xpcname" "$xpcname.xpc"
+              fi
+            fi
+          done
+
+          echo "✓ All binaries fakesigned"
+
+      - name: Package IPA
+        run: |
+          echo "📦 Packaging final IPA..."
+
+          cd target_extract
+
+          # Remove any .DS_Store files
+          find . -name ".DS_Store" -delete
+
+          # Create the final .tipa
+          zip -r -y "../${{ inputs.output_name }}.tipa" Payload
+
+          cd ..
+          echo "✓ Created ${{ inputs.output_name }}.tipa"
+          ls -lh "${{ inputs.output_name }}.tipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: ${{ inputs.output_name }}.tipa
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          echo "## 🎉 CyberKit Injection Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source IPA**: ${{ inputs.ipa_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CyberKit Version**: ${{ inputs.cyberkit_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Output**: ${{ inputs.output_name }}.tipa" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the artifact and install via TrollStore!" >> $GITHUB_STEP_SUMMARY
