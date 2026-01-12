@@ -35,17 +35,36 @@ jobs:
         run: |
           echo "📦 Fetching CyberKit ${{ inputs.cyberkit_tag }}..."
 
-          # Get release assets from GitHub API
+          # Try API first, fall back to direct URL
           RELEASE_URL="https://api.github.com/repos/CyberKitGroup/CyberKit/releases/tags/${{ inputs.cyberkit_tag }}"
-          ASSETS=$(curl -sL "$RELEASE_URL" | jq -r '.assets[] | select(.name | endswith(".tipa")) | .browser_download_url' | head -1)
+          echo "Trying API: $RELEASE_URL"
 
-          if [ -z "$ASSETS" ]; then
-            echo "❌ No .tipa found in release ${{ inputs.cyberkit_tag }}"
+          RELEASE_JSON=$(curl -sL "$RELEASE_URL")
+          ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".tipa")) | .browser_download_url' 2>/dev/null | head -1)
+
+          if [ -z "$ASSETS" ] || [ "$ASSETS" = "null" ]; then
+            echo "⚠️ API failed or no .tipa found, trying direct download..."
+            # Fallback: try known release patterns
+            DIRECT_URL="https://github.com/CyberKitGroup/CyberKit/releases/download/${{ inputs.cyberkit_tag }}/com.matthewbenedict.mobileminibrowser15_0.0.9-alpha.tipa"
+            echo "Trying: $DIRECT_URL"
+            curl -L -o cyberkit.tipa "$DIRECT_URL" || {
+              # Try iOS 16 version
+              DIRECT_URL="https://github.com/CyberKitGroup/CyberKit/releases/download/${{ inputs.cyberkit_tag }}/com.matthewbenedict.mobileminibrowser16_0.0.9-alpha.tipa"
+              echo "Trying: $DIRECT_URL"
+              curl -L -o cyberkit.tipa "$DIRECT_URL"
+            }
+          else
+            echo "⬇️ Downloading via API: $ASSETS"
+            curl -L -o cyberkit.tipa "$ASSETS"
+          fi
+
+          # Verify download
+          if [ ! -f cyberkit.tipa ] || [ ! -s cyberkit.tipa ]; then
+            echo "❌ Failed to download CyberKit tipa"
             exit 1
           fi
 
-          echo "⬇️ Downloading: $ASSETS"
-          curl -L -o cyberkit.tipa "$ASSETS"
+          echo "✓ Downloaded CyberKit tipa ($(ls -lh cyberkit.tipa | awk '{print $5}'))"
 
           # Extract CyberKit frameworks
           mkdir -p cyberkit_extract
