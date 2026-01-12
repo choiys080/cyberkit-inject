@@ -226,74 +226,55 @@ jobs:
           EOF
           echo "✓ Entitlements file created"
 
-      - name: Fakesign all binaries
+      - name: Strip existing signatures (TrollStore will re-sign)
         run: |
-          echo "🔏 Fakesigning binaries..."
+          echo "🔏 Stripping existing signatures..."
 
           TARGET_APP="${{ env.TARGET_APP }}"
-          APP_NAME="${{ env.APP_NAME }}"
 
-          # Function to merge entitlements and sign
-          fakesign_binary() {
+          # Remove all _CodeSignature directories
+          find "$TARGET_APP" -type d -name "_CodeSignature" -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove any embedded.mobileprovision files
+          find "$TARGET_APP" -name "embedded.mobileprovision" -delete 2>/dev/null || true
+
+          # Use codesign to strip signatures from all binaries (if available)
+          # If not, ldid with empty signature
+          strip_signature() {
             local bin="$1"
-            local name="$2"
-
-            # Try to get existing entitlements
-            existing_ents=$(ldid -e "$bin" 2>/dev/null || echo "")
-
-            if [ -n "$existing_ents" ] && echo "$existing_ents" | grep -q "<dict>"; then
-              # Merge entitlements
-              static_ents=$(cat entitlements.plist)
-              static_ents=${static_ents%</dict>*}
-              existing_ents=${existing_ents#*<dict>}
-              existing_ents=${existing_ents%</dict>*}
-              echo "${static_ents}${existing_ents}</dict></plist>" > merged_ents.plist
-              ldid -S"merged_ents.plist" "$bin"
-              rm -f merged_ents.plist
-            else
-              ldid -S"entitlements.plist" "$bin"
-            fi
-
-            echo "  ✓ Signed: $name"
+            codesign --remove-signature "$bin" 2>/dev/null || ldid -S "$bin" 2>/dev/null || true
           }
 
-          # Sign the main executable
-          EXECUTABLE="$TARGET_APP/$APP_NAME"
-          if [ -f "$EXECUTABLE" ]; then
-            fakesign_binary "$EXECUTABLE" "$APP_NAME"
+          # Strip main executable
+          APP_NAME="${{ env.APP_NAME }}"
+          if [ -f "$TARGET_APP/$APP_NAME" ]; then
+            strip_signature "$TARGET_APP/$APP_NAME"
+            echo "  ✓ Stripped: $APP_NAME"
           fi
 
-          # Sign all frameworks
+          # Strip frameworks
           if [ -d "$TARGET_APP/Frameworks" ]; then
             for fw in "$TARGET_APP/Frameworks"/*.framework; do
               if [ -d "$fw" ]; then
                 fwname=$(basename "$fw" .framework)
-                fwbin="$fw/$fwname"
-                if [ -f "$fwbin" ]; then
-                  fakesign_binary "$fwbin" "$fwname.framework"
+                if [ -f "$fw/$fwname" ]; then
+                  strip_signature "$fw/$fwname"
+                  echo "  ✓ Stripped: $fwname.framework"
                 fi
               fi
             done
 
-            # Sign dylibs
+            # Strip dylibs
             for dylib in "$TARGET_APP/Frameworks"/*.dylib; do
               if [ -f "$dylib" ]; then
-                fakesign_binary "$dylib" "$(basename $dylib)"
+                strip_signature "$dylib"
+                echo "  ✓ Stripped: $(basename $dylib)"
               fi
             done
           fi
 
-          # Sign XPC services if present
-          for xpc_dir in "$TARGET_APP/Frameworks"/*.framework/XPCServices/*.xpc; do
-            if [ -d "$xpc_dir" ]; then
-              xpcname=$(basename "$xpc_dir" .xpc)
-              if [ -f "$xpc_dir/$xpcname" ]; then
-                fakesign_binary "$xpc_dir/$xpcname" "$xpcname.xpc"
-              fi
-            fi
-          done
+          echo "✓ Signatures stripped - TrollStore will re-sign"
 
-          echo "✓ All binaries fakesigned"
 
       - name: Package IPA
         run: |
